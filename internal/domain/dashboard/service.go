@@ -3,45 +3,38 @@ package dashboard
 import (
 	"fmt"
 
-	"finance-backend-challenge/internal/apierr"
-
 	"github.com/jmoiron/sqlx"
 )
 
 type Summary struct {
-	TotalIncome   float64 `json:"total_income"   db:"total_income"`
-	TotalExpenses float64 `json:"total_expenses" db:"total_expenses"`
+	TotalIncome   float64 `json:"total_income"`
+	TotalExpenses float64 `json:"total_expenses"`
 	NetBalance    float64 `json:"net_balance"`
-	RecordCount   int     `json:"record_count"   db:"record_count"`
+	RecordCount   int     `json:"record_count"`
 }
 
-// CategoryTotal holds aggregated amounts per category.
 type CategoryTotal struct {
-	Category string  `json:"category" db:"category"`
-	Type     string  `json:"type"     db:"type"`
-	Total    float64 `json:"total"    db:"total"`
-	Count    int     `json:"count"    db:"count"`
+	Category string  `json:"category"`
+	Type     string  `json:"type"`
+	Total    float64 `json:"total"`
+	Count    int     `json:"count"`
 }
 
-// MonthlyTrend holds income/expense totals per calendar month.
 type MonthlyTrend struct {
-	Month         string  `json:"month"          db:"month"`
-	TotalIncome   float64 `json:"total_income"   db:"total_income"`
-	TotalExpenses float64 `json:"total_expenses" db:"total_expenses"`
+	Month         string  `json:"month"`
+	TotalIncome   float64 `json:"total_income"`
+	TotalExpenses float64 `json:"total_expenses"`
 	NetBalance    float64 `json:"net_balance"`
 }
 
-// RecentRecord is a lightweight projection for the recent activity feed.
 type RecentRecord struct {
-	ID       string  `json:"id"       db:"id"`
-	Amount   float64 `json:"amount"   db:"amount"`
-	Type     string  `json:"type"     db:"type"`
-	Category string  `json:"category" db:"category"`
-	Date     string  `json:"date"     db:"date"`
-	Notes    string  `json:"notes"    db:"notes"`
+	ID       int     `json:"id"`
+	Amount   float64 `json:"amount"`
+	Type     string  `json:"type"`
+	Category string  `json:"category"`
+	Date     string  `json:"date"`
+	Notes    string  `json:"notes"`
 }
-
-// --- Service ---
 
 type Service struct {
 	db *sqlx.DB
@@ -51,96 +44,85 @@ func NewService(db *sqlx.DB) *Service {
 	return &Service{db: db}
 }
 
-func (s *Service) GetSummary() (*Summary, *apierr.APIError) {
+func (s *Service) GetSummary(userID int) (*Summary, error) {
 	var summary Summary
-	err := s.db.QueryRowx(`
+	query := `
 		SELECT
-			COALESCE(SUM(CASE WHEN type = 'income'  THEN amount ELSE 0 END), 0) AS total_income,
+			COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) AS total_income,
 			COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS total_expenses,
 			COUNT(*) AS record_count
-		FROM financial_records
-		WHERE deleted_at IS NULL
-	`).Scan(&summary.TotalIncome, &summary.TotalExpenses, &summary.RecordCount)
+		FROM records
+		WHERE user_id = ?`
+	err := s.db.QueryRow(query, userID).Scan(&summary.TotalIncome, &summary.TotalExpenses, &summary.RecordCount)
 	if err != nil {
-		return nil, apierr.Internal(fmt.Sprintf("dashboard.GetSummary: %v", err))
+		return nil, fmt.Errorf("failed to get summary: %w", err)
 	}
 
 	summary.NetBalance = summary.TotalIncome - summary.TotalExpenses
 	return &summary, nil
 }
 
-func (s *Service) GetByCategory() ([]*CategoryTotal, *apierr.APIError) {
-	var totals []*CategoryTotal
-	err := s.db.Select(&totals, `
+func (s *Service) GetByCategory(userID int) ([]CategoryTotal, error) {
+	var totals []CategoryTotal
+	query := `
 		SELECT
 			category,
 			type,
 			SUM(amount) AS total,
-			COUNT(*)    AS count
-		FROM financial_records
-		WHERE deleted_at IS NULL
+			COUNT(*) AS count
+		FROM records
+		WHERE user_id = ?
 		GROUP BY category, type
-		ORDER BY total DESC
-	`)
+		ORDER BY total DESC`
+	err := s.db.Select(&totals, query, userID)
 	if err != nil {
-		return nil, apierr.Internal(fmt.Sprintf("dashboard.GetByCategory: %v", err))
+		return nil, fmt.Errorf("failed to get category totals: %w", err)
 	}
 	return totals, nil
 }
 
-func (s *Service) GetMonthlyTrends(months int) ([]*MonthlyTrend, *apierr.APIError) {
+func (s *Service) GetMonthlyTrends(userID int, months int) ([]MonthlyTrend, error) {
 	if months < 1 || months > 24 {
-		months = 12 // sensible default
+		months = 12
 	}
 
-	var rows []*struct {
-		Month         string  `db:"month"`
-		TotalIncome   float64 `db:"total_income"`
-		TotalExpenses float64 `db:"total_expenses"`
-	}
-
-	err := s.db.Select(&rows, `
+	var trends []MonthlyTrend
+	query := `
 		SELECT
-			TO_CHAR(date, 'YYYY-MM') AS month,
-			COALESCE(SUM(CASE WHEN type = 'income'  THEN amount ELSE 0 END), 0) AS total_income,
-			COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS total_expenses
-		FROM financial_records
-		WHERE deleted_at IS NULL
-		  AND date >= DATE_TRUNC('month', NOW()) - ($1 - 1) * INTERVAL '1 month'
-		GROUP BY TO_CHAR(date, 'YYYY-MM')
-		ORDER BY month ASC
-	`, months)
+			strftime('%Y-%m', date) AS month,
+			SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END) AS total_income,
+			SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END) AS total_expenses
+		FROM records
+		WHERE user_id = ?
+		GROUP BY strftime('%Y-%m', date)
+		ORDER BY month DESC
+		LIMIT ?`
+	err := s.db.Select(&trends, query, userID, months)
 	if err != nil {
-		return nil, apierr.Internal(fmt.Sprintf("dashboard.GetMonthlyTrends: %v", err))
+		return nil, fmt.Errorf("failed to get monthly trends: %w", err)
 	}
 
-	trends := make([]*MonthlyTrend, len(rows))
-	for i, row := range rows {
-		trends[i] = &MonthlyTrend{
-			Month:         row.Month,
-			TotalIncome:   row.TotalIncome,
-			TotalExpenses: row.TotalExpenses,
-			NetBalance:    row.TotalIncome - row.TotalExpenses,
-		}
+	for i := range trends {
+		trends[i].NetBalance = trends[i].TotalIncome - trends[i].TotalExpenses
 	}
 	return trends, nil
 }
 
-func (s *Service) GetRecentActivity(limit int) ([]*RecentRecord, *apierr.APIError) {
+func (s *Service) GetRecentActivity(userID int, limit int) ([]RecentRecord, error) {
 	if limit < 1 || limit > 50 {
 		limit = 10
 	}
 
-	var records []*RecentRecord
-	err := s.db.Select(&records, `
-		SELECT id, amount, type, category, date::TEXT, COALESCE(notes, '') AS notes
-		FROM financial_records
-		WHERE deleted_at IS NULL
+	var records []RecentRecord
+	query := `
+		SELECT id, amount, type, category, date, COALESCE(notes, '') AS notes
+		FROM records
+		WHERE user_id = ?
 		ORDER BY date DESC, created_at DESC
-		LIMIT $1
-	`, limit)
+		LIMIT ?`
+	err := s.db.Select(&records, query, userID, limit)
 	if err != nil {
-		return nil, apierr.Internal(fmt.Sprintf("dashboard.GetRecentActivity: %v", err))
+		return nil, fmt.Errorf("failed to get recent activity: %w", err)
 	}
 	return records, nil
 }

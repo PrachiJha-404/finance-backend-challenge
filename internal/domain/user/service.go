@@ -6,27 +6,18 @@ import (
 	"fmt"
 	"time"
 
-	"finance-backend/internal/apierr"
-	"finance-backend/pkg/validator"
+	"finance-backend-challenge/pkg/validator"
 
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 )
 
-// Service contains all business logic for the user domain.
-// It depends only on the Repository interface — never on a concrete DB type.
-// This is Dependency Inversion in practice.
-//
-// GRASP Controller: the service acts as the system-level controller for
-// user operations. HTTP handlers delegate to it; they own no logic themselves.
 type Service struct {
 	repo      Repository
 	jwtSecret string
 	jwtExpiry int // hours
 }
 
-// NewService is the factory function for Service.
-// All dependencies are injected — the service never constructs its own.
 func NewService(repo Repository, jwtSecret string, jwtExpiry int) *Service {
 	return &Service{
 		repo:      repo,
@@ -35,195 +26,177 @@ func NewService(repo Repository, jwtSecret string, jwtExpiry int) *Service {
 	}
 }
 
-// Register creates a new user account with a hashed password.
-func (s *Service) Register(req *RegisterRequest) (*User, *apierr.APIError) {
+func (s *Service) CreateUser(req *CreateUserRequest) (*User, error) {
 	v := validator.New()
-	v.Required("name", req.Name)
 	v.Required("email", req.Email)
 	v.IsEmail("email", req.Email)
-	v.MinLength("password", req.Password, 8)
+	v.Required("password", req.Password)
+	v.MinLength("password", req.Password, 6)
+	v.Required("role", string(req.Role))
 	if v.HasErrors() {
-		return nil, apierr.BadRequest(v.Error())
+		return nil, fmt.Errorf("validation error: %s", v.Error())
 	}
 
 	// Check for duplicate email
 	existing, err := s.repo.GetByEmail(req.Email)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, apierr.Internal("")
+		return nil, fmt.Errorf("failed to check existing user: %w", err)
 	}
 	if existing != nil {
-		return nil, apierr.Conflict("a user with this email already exists")
+		return nil, fmt.Errorf("user with this email already exists")
 	}
 
 	hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
-		return nil, apierr.Internal("failed to process password")
+		return nil, fmt.Errorf("failed to hash password: %w", err)
 	}
 
 	u := &User{
-		Name:     req.Name,
-		Email:    req.Email,
-		Password: string(hashed),
-		Role:     RoleViewer, // New users start as viewers — admin promotes them
-		Status:   StatusActive,
+		Email:        req.Email,
+		PasswordHash: string(hashed),
+		Role:         req.Role,
+		Status:       StatusActive,
 	}
 
-	created, err := s.repo.Create(u)
+	err = s.repo.Create(u)
 	if err != nil {
-		return nil, apierr.Internal(fmt.Sprintf("failed to create user: %v", err))
-	}
-	return created, nil
-}
-
-// Login verifies credentials and returns a signed JWT on success.
-func (s *Service) Login(req *LoginRequest) (*LoginResponse, *apierr.APIError) {
-	v := validator.New()
-	v.Required("email", req.Email)
-	v.Required("password", req.Password)
-	if v.HasErrors() {
-		return nil, apierr.BadRequest(v.Error())
-	}
-
-	u, err := s.repo.GetByEmail(req.Email)
-	if err != nil {
-		// Deliberately vague — do not reveal whether the email exists
-		return nil, apierr.Unauthorized("invalid email or password")
-	}
-
-	if !u.IsActive() {
-		return nil, apierr.Forbidden("this account has been deactivated")
-	}
-
-	if err := bcrypt.CompareHashAndPassword([]byte(u.Password), []byte(req.Password)); err != nil {
-		return nil, apierr.Unauthorized("invalid email or password")
-	}
-
-	token, err := s.generateToken(u)
-	if err != nil {
-		return nil, apierr.Internal("failed to generate token")
-	}
-
-	return &LoginResponse{Token: token, User: u}, nil
-}
-
-// GetByID returns a single user. Admins may fetch any user.
-func (s *Service) GetByID(id string) (*User, *apierr.APIError) {
-	u, err := s.repo.GetByID(id)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, apierr.NotFound("user not found")
-		}
-		return nil, apierr.Internal("")
+		return nil, fmt.Errorf("failed to create user: %w", err)
 	}
 	return u, nil
 }
 
-// List returns all users. Admin only — enforced at the middleware layer,
-// but the service is the right place to describe *what* this operation does.
-func (s *Service) List() ([]*User, *apierr.APIError) {
-	users, err := s.repo.List()
-	if err != nil {
-		return nil, apierr.Internal("")
+func (s *Service) Login(req *LoginRequest) (*AuthResponse, error) {
+	v := validator.New()
+	v.Required("email", req.Email)
+	v.Required("password", req.Password)
+	if v.HasErrors() {
+		return nil, fmt.Errorf("validation error: %s", v.Error())
 	}
-	return users, nil
+
+	u, err := s.repo.GetByEmail(req.Email)
+	if err != nil {
+		return nil, fmt.Errorf("invalid email or password")
+	}
+	if u == nil {
+		return nil, fmt.Errorf("invalid email or password")
+	}
+
+	if u.Status != StatusActive {
+		return nil, fmt.Errorf("account is inactive")
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(req.Password)); err != nil {
+		return nil, fmt.Errorf("invalid email or password")
+	}
+
+	token, err := s.generateToken(u)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate token: %w", err)
+	}
+
+	return &AuthResponse{Token: token, User: *u}, nil
 }
 
-// Update modifies a user's name, role, or status.
-func (s *Service) Update(id string, req *UpdateRequest) (*User, *apierr.APIError) {
-	v := validator.New()
-	v.Required("name", req.Name)
-	if req.Role != "" {
-		v.OneOf("role", req.Role, string(RoleViewer), string(RoleAnalyst), string(RoleAdmin))
-	}
-	if req.Status != "" {
-		v.OneOf("status", req.Status, string(StatusActive), string(StatusInactive))
-	}
-	if v.HasErrors() {
-		return nil, apierr.BadRequest(v.Error())
-	}
-
+func (s *Service) GetUserByID(id int) (*User, error) {
 	u, err := s.repo.GetByID(id)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, apierr.NotFound("user not found")
-		}
-		return nil, apierr.Internal("")
+		return nil, err
 	}
-
-	u.Name = req.Name
-	if req.Role != "" {
-		u.Role = Role(req.Role)
+	if u == nil {
+		return nil, fmt.Errorf("user not found")
 	}
-	if req.Status != "" {
-		u.Status = Status(req.Status)
-	}
-
-	updated, err := s.repo.Update(u)
-	if err != nil {
-		return nil, apierr.Internal("")
-	}
-	return updated, nil
+	return u, nil
 }
 
-// UpdateStatus changes only the active/inactive status of a user.
-func (s *Service) UpdateStatus(id string, req *UpdateStatusRequest) (*User, *apierr.APIError) {
-	v := validator.New()
-	v.OneOf("status", req.Status, string(StatusActive), string(StatusInactive))
-	if v.HasErrors() {
-		return nil, apierr.BadRequest(v.Error())
-	}
+func (s *Service) UpdateUser(id int, req *UpdateUserRequest) (*User, error) {
+	updates := make(map[string]interface{})
 
-	u, err := s.repo.GetByID(id)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, apierr.NotFound("user not found")
+	if req.Email != nil {
+		v := validator.New()
+		v.IsEmail("email", *req.Email)
+		if v.HasErrors() {
+			return nil, fmt.Errorf("validation error: %s", v.Error())
 		}
-		return nil, apierr.Internal("")
+		updates["email"] = *req.Email
 	}
 
-	u.Status = Status(req.Status)
-	updated, err := s.repo.Update(u)
-	if err != nil {
-		return nil, apierr.Internal("")
+	if req.Role != nil {
+		updates["role"] = *req.Role
 	}
-	return updated, nil
+
+	if req.Status != nil {
+		updates["status"] = *req.Status
+	}
+
+	if len(updates) == 0 {
+		return nil, fmt.Errorf("no fields to update")
+	}
+
+	err := s.repo.Update(id, updates)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update user: %w", err)
+	}
+
+	return s.repo.GetByID(id)
 }
 
-// --- JWT helpers ---
+func (s *Service) DeleteUser(id int) error {
+	return s.repo.Delete(id)
+}
 
-type Claims struct {
-	UserID string `json:"user_id"`
-	Role   Role   `json:"role"`
-	jwt.RegisteredClaims
+func (s *Service) ListUsers() ([]User, error) {
+	return s.repo.List()
 }
 
 func (s *Service) generateToken(u *User) (string, error) {
-	claims := Claims{
-		UserID: u.ID,
-		Role:   u.Role,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(s.jwtExpiry) * time.Hour)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-		},
+	claims := jwt.MapClaims{
+		"user_id": u.ID,
+		"email":   u.Email,
+		"role":    string(u.Role),
+		"exp":     time.Now().Add(time.Hour * time.Duration(s.jwtExpiry)).Unix(),
+		"iat":     time.Now().Unix(),
 	}
+
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(s.jwtSecret))
 }
 
-// ParseToken validates a JWT string and returns the embedded claims.
-func (s *Service) ParseToken(tokenStr string) (*Claims, error) {
-	token, err := jwt.ParseWithClaims(tokenStr, &Claims{}, func(t *jwt.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+func (s *Service) ValidateToken(tokenString string) (*struct {
+	ID    int
+	Email string
+	Role  string
+}, error) {
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 		return []byte(s.jwtSecret), nil
 	})
+
 	if err != nil {
 		return nil, err
 	}
-	claims, ok := token.Claims.(*Claims)
-	if !ok || !token.Valid {
-		return nil, fmt.Errorf("invalid token")
+
+	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+		userIDFloat, ok := claims["user_id"].(float64)
+		if !ok {
+			return nil, fmt.Errorf("invalid user_id in token")
+		}
+		userID := int(userIDFloat)
+
+		u, err := s.repo.GetByID(userID)
+		if err != nil {
+			return nil, err
+		}
+		if u == nil {
+			return nil, fmt.Errorf("user not found")
+		}
+		return &struct {
+			ID    int
+			Email string
+			Role  string
+		}{ID: u.ID, Email: u.Email, Role: string(u.Role)}, nil
 	}
-	return claims, nil
+
+	return nil, fmt.Errorf("invalid token")
 }

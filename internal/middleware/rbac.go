@@ -3,13 +3,12 @@ package middleware
 import (
 	"net/http"
 
-	"finance-backend/internal/apierr"
-	"finance-backend/internal/domain/user"
+	"finance-backend-challenge/internal/apierr"
 )
 
-func RequireRoles(roles ...user.Role) func(http.Handler) http.Handler {
+func RequireRoles(roles ...string) func(http.Handler) http.Handler {
 
-	allowed := make(map[user.Role]struct{}, len(roles))
+	allowed := make(map[string]struct{}, len(roles))
 	for _, r := range roles {
 		allowed[r] = struct{}{}
 	}
@@ -34,13 +33,13 @@ func RequireRoles(roles ...user.Role) func(http.Handler) http.Handler {
 }
 
 func AdminOnly() func(http.Handler) http.Handler {
-	return RequireRoles(user.RoleAdmin)
+	return RequireRoles("admin")
 }
 
 func AnalystAndAbove() func(http.Handler) http.Handler {
-	return RequireRoles(user.RoleAnalyst, user.RoleAdmin)
+	return RequireRoles("analyst", "admin")
 }
 
 func AnyRole() func(http.Handler) http.Handler {
-	return RequireRoles(user.RoleViewer, user.RoleAnalyst, user.RoleAdmin)
+	return RequireRoles("viewer", "analyst", "admin")
 }

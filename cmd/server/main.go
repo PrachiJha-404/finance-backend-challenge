@@ -6,12 +6,12 @@ import (
 	"net/http"
 	"time"
 
-	"finance-backend/internal/config"
-	"finance-backend/internal/db"
-	"finance-backend/internal/domain/dashboard"
-	"finance-backend/internal/domain/record"
-	"finance-backend/internal/domain/user"
-	"finance-backend/internal/middleware"
+	"finance-backend-challenge/internal/config"
+	"finance-backend-challenge/internal/db"
+	"finance-backend-challenge/internal/domain/dashboard"
+	"finance-backend-challenge/internal/domain/record"
+	"finance-backend-challenge/internal/domain/user"
+	"finance-backend-challenge/internal/middleware"
 
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"

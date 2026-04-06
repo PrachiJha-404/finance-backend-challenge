@@ -2,6 +2,8 @@ package db
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"finance-backend-challenge/internal/config"
 
@@ -20,4 +22,19 @@ func Connect(cfg *config.Config) (*sqlx.DB, error) {
 	}
 
 	return db, nil
+}
+
+func Migrate(db *sqlx.DB) error {
+	migrationFile := filepath.Join("internal", "db", "migrations", "001_initial_schema.sql")
+	sqlBytes, err := os.ReadFile(migrationFile)
+	if err != nil {
+		return fmt.Errorf("failed to read migration file: %w", err)
+	}
+
+	_, err = db.Exec(string(sqlBytes))
+	if err != nil {
+		return fmt.Errorf("failed to execute migration: %w", err)
+	}
+
+	return nil
 }

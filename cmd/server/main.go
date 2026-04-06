@@ -34,6 +34,11 @@ func main() {
 	defer database.Close()
 	log.Println("database connection established")
 
+	if err := db.Migrate(database); err != nil {
+		log.Fatalf("failed to migrate database: %v", err)
+	}
+	log.Println("database migration completed")
+
 	// User domain
 	userRepo := user.NewPostgresRepository(database)
 	userService := user.NewService(userRepo, cfg.JWTSecret, cfg.JWTExpiryHours)

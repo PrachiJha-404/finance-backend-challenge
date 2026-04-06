@@ -21,7 +21,7 @@ func NewHandler(service *Service) *Handler {
 
 func (h *Handler) RegisterRoutes(r chi.Router, authMiddleware, adminOnlyMiddleware func(http.Handler) http.Handler) {
 	r.Post("/auth/login", h.Login)
-	r.Post("/users", h.CreateUser) // Allow creating users without auth for initial setup
+	r.Post("/auth/register", h.CreateUser) // Allow creating users without auth for initial setup
 
 	r.Route("/users", func(r chi.Router) {
 		r.Use(authMiddleware)

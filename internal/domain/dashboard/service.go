@@ -1,209 +1,146 @@
-package user
+package dashboard
 
 import (
-	"database/sql"
-	"errors"
 	"fmt"
-	"time"
 
 	"finance-backend-challenge/internal/apierr"
-	"finance-backend-challenge/pkg/validator"
 
-	"github.com/golang-jwt/jwt/v5"
-	"golang.org/x/crypto/bcrypt"
+	"github.com/jmoiron/sqlx"
 )
 
+type Summary struct {
+	TotalIncome   float64 `json:"total_income"   db:"total_income"`
+	TotalExpenses float64 `json:"total_expenses" db:"total_expenses"`
+	NetBalance    float64 `json:"net_balance"`
+	RecordCount   int     `json:"record_count"   db:"record_count"`
+}
+
+// CategoryTotal holds aggregated amounts per category.
+type CategoryTotal struct {
+	Category string  `json:"category" db:"category"`
+	Type     string  `json:"type"     db:"type"`
+	Total    float64 `json:"total"    db:"total"`
+	Count    int     `json:"count"    db:"count"`
+}
+
+// MonthlyTrend holds income/expense totals per calendar month.
+type MonthlyTrend struct {
+	Month         string  `json:"month"          db:"month"`
+	TotalIncome   float64 `json:"total_income"   db:"total_income"`
+	TotalExpenses float64 `json:"total_expenses" db:"total_expenses"`
+	NetBalance    float64 `json:"net_balance"`
+}
+
+// RecentRecord is a lightweight projection for the recent activity feed.
+type RecentRecord struct {
+	ID       string  `json:"id"       db:"id"`
+	Amount   float64 `json:"amount"   db:"amount"`
+	Type     string  `json:"type"     db:"type"`
+	Category string  `json:"category" db:"category"`
+	Date     string  `json:"date"     db:"date"`
+	Notes    string  `json:"notes"    db:"notes"`
+}
+
+// --- Service ---
+
 type Service struct {
-	repo      Repository
-	jwtSecret string
-	jwtExpiry int // hours
+	db *sqlx.DB
 }
 
-func NewService(repo Repository, jwtSecret string, jwtExpiry int) *Service {
-	return &Service{
-		repo:      repo,
-		jwtSecret: jwtSecret,
-		jwtExpiry: jwtExpiry,
-	}
+func NewService(db *sqlx.DB) *Service {
+	return &Service{db: db}
 }
 
-func (s *Service) Register(req *RegisterRequest) (*User, *apierr.APIError) {
-	v := validator.New()
-	v.Required("name", req.Name)
-	v.Required("email", req.Email)
-	v.IsEmail("email", req.Email)
-	v.MinLength("password", req.Password, 8)
-	if v.HasErrors() {
-		return nil, apierr.BadRequest(v.Error())
-	}
-
-	existing, err := s.repo.GetByEmail(req.Email)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, apierr.Internal("")
-	}
-	if existing != nil {
-		return nil, apierr.Conflict("a user with this email already exists")
-	}
-
-	hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+func (s *Service) GetSummary() (*Summary, *apierr.APIError) {
+	var summary Summary
+	err := s.db.QueryRowx(`
+		SELECT
+			COALESCE(SUM(CASE WHEN type = 'income'  THEN amount ELSE 0 END), 0) AS total_income,
+			COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS total_expenses,
+			COUNT(*) AS record_count
+		FROM financial_records
+		WHERE deleted_at IS NULL
+	`).Scan(&summary.TotalIncome, &summary.TotalExpenses, &summary.RecordCount)
 	if err != nil {
-		return nil, apierr.Internal("failed to process password")
+		return nil, apierr.Internal(fmt.Sprintf("dashboard.GetSummary: %v", err))
 	}
 
-	u := &User{
-		Name:     req.Name,
-		Email:    req.Email,
-		Password: string(hashed),
-		Role:     RoleViewer,
-		Status:   StatusActive,
-	}
-
-	created, err := s.repo.Create(u)
-	if err != nil {
-		return nil, apierr.Internal(fmt.Sprintf("failed to create user: %v", err))
-	}
-	return created, nil
+	summary.NetBalance = summary.TotalIncome - summary.TotalExpenses
+	return &summary, nil
 }
 
-func (s *Service) Login(req *LoginRequest) (*LoginResponse, *apierr.APIError) {
-	v := validator.New()
-	v.Required("email", req.Email)
-	v.Required("password", req.Password)
-	if v.HasErrors() {
-		return nil, apierr.BadRequest(v.Error())
-	}
-
-	u, err := s.repo.GetByEmail(req.Email)
+func (s *Service) GetByCategory() ([]*CategoryTotal, *apierr.APIError) {
+	var totals []*CategoryTotal
+	err := s.db.Select(&totals, `
+		SELECT
+			category,
+			type,
+			SUM(amount) AS total,
+			COUNT(*)    AS count
+		FROM financial_records
+		WHERE deleted_at IS NULL
+		GROUP BY category, type
+		ORDER BY total DESC
+	`)
 	if err != nil {
-		return nil, apierr.Unauthorized("invalid email or password")
+		return nil, apierr.Internal(fmt.Sprintf("dashboard.GetByCategory: %v", err))
 	}
-
-	if !u.IsActive() {
-		return nil, apierr.Forbidden("this account has been deactivated")
-	}
-
-	if err := bcrypt.CompareHashAndPassword([]byte(u.Password), []byte(req.Password)); err != nil {
-		return nil, apierr.Unauthorized("invalid email or password")
-	}
-
-	token, err := s.generateToken(u)
-	if err != nil {
-		return nil, apierr.Internal("failed to generate token")
-	}
-
-	return &LoginResponse{Token: token, User: u}, nil
+	return totals, nil
 }
 
-func (s *Service) GetByID(id string) (*User, *apierr.APIError) {
-	u, err := s.repo.GetByID(id)
+func (s *Service) GetMonthlyTrends(months int) ([]*MonthlyTrend, *apierr.APIError) {
+	if months < 1 || months > 24 {
+		months = 12 // sensible default
+	}
+
+	var rows []*struct {
+		Month         string  `db:"month"`
+		TotalIncome   float64 `db:"total_income"`
+		TotalExpenses float64 `db:"total_expenses"`
+	}
+
+	err := s.db.Select(&rows, `
+		SELECT
+			TO_CHAR(date, 'YYYY-MM') AS month,
+			COALESCE(SUM(CASE WHEN type = 'income'  THEN amount ELSE 0 END), 0) AS total_income,
+			COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS total_expenses
+		FROM financial_records
+		WHERE deleted_at IS NULL
+		  AND date >= DATE_TRUNC('month', NOW()) - ($1 - 1) * INTERVAL '1 month'
+		GROUP BY TO_CHAR(date, 'YYYY-MM')
+		ORDER BY month ASC
+	`, months)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, apierr.NotFound("user not found")
+		return nil, apierr.Internal(fmt.Sprintf("dashboard.GetMonthlyTrends: %v", err))
+	}
+
+	trends := make([]*MonthlyTrend, len(rows))
+	for i, row := range rows {
+		trends[i] = &MonthlyTrend{
+			Month:         row.Month,
+			TotalIncome:   row.TotalIncome,
+			TotalExpenses: row.TotalExpenses,
+			NetBalance:    row.TotalIncome - row.TotalExpenses,
 		}
-		return nil, apierr.Internal("")
 	}
-	return u, nil
+	return trends, nil
 }
 
-func (s *Service) List() ([]*User, *apierr.APIError) {
-	users, err := s.repo.List()
+func (s *Service) GetRecentActivity(limit int) ([]*RecentRecord, *apierr.APIError) {
+	if limit < 1 || limit > 50 {
+		limit = 10
+	}
+
+	var records []*RecentRecord
+	err := s.db.Select(&records, `
+		SELECT id, amount, type, category, date::TEXT, COALESCE(notes, '') AS notes
+		FROM financial_records
+		WHERE deleted_at IS NULL
+		ORDER BY date DESC, created_at DESC
+		LIMIT $1
+	`, limit)
 	if err != nil {
-		return nil, apierr.Internal("")
+		return nil, apierr.Internal(fmt.Sprintf("dashboard.GetRecentActivity: %v", err))
 	}
-	return users, nil
-}
-
-func (s *Service) Update(id string, req *UpdateRequest) (*User, *apierr.APIError) {
-	v := validator.New()
-	v.Required("name", req.Name)
-	if req.Role != "" {
-		v.OneOf("role", req.Role, string(RoleViewer), string(RoleAnalyst), string(RoleAdmin))
-	}
-	if req.Status != "" {
-		v.OneOf("status", req.Status, string(StatusActive), string(StatusInactive))
-	}
-	if v.HasErrors() {
-		return nil, apierr.BadRequest(v.Error())
-	}
-
-	u, err := s.repo.GetByID(id)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, apierr.NotFound("user not found")
-		}
-		return nil, apierr.Internal("")
-	}
-
-	u.Name = req.Name
-	if req.Role != "" {
-		u.Role = Role(req.Role)
-	}
-	if req.Status != "" {
-		u.Status = Status(req.Status)
-	}
-
-	updated, err := s.repo.Update(u)
-	if err != nil {
-		return nil, apierr.Internal("")
-	}
-	return updated, nil
-}
-
-func (s *Service) UpdateStatus(id string, req *UpdateStatusRequest) (*User, *apierr.APIError) {
-	v := validator.New()
-	v.OneOf("status", req.Status, string(StatusActive), string(StatusInactive))
-	if v.HasErrors() {
-		return nil, apierr.BadRequest(v.Error())
-	}
-
-	u, err := s.repo.GetByID(id)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, apierr.NotFound("user not found")
-		}
-		return nil, apierr.Internal("")
-	}
-
-	u.Status = Status(req.Status)
-	updated, err := s.repo.Update(u)
-	if err != nil {
-		return nil, apierr.Internal("")
-	}
-	return updated, nil
-}
-
-type Claims struct {
-	UserID string `json:"user_id"`
-	Role   Role   `json:"role"`
-	jwt.RegisteredClaims
-}
-
-func (s *Service) generateToken(u *User) (string, error) {
-	claims := Claims{
-		UserID: u.ID,
-		Role:   u.Role,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(s.jwtExpiry) * time.Hour)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-		},
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString([]byte(s.jwtSecret))
-}
-
-func (s *Service) ParseToken(tokenStr string) (*Claims, error) {
-	token, err := jwt.ParseWithClaims(tokenStr, &Claims{}, func(t *jwt.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-		}
-		return []byte(s.jwtSecret), nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	claims, ok := token.Claims.(*Claims)
-	if !ok || !token.Valid {
-		return nil, fmt.Errorf("invalid token")
-	}
-	return claims, nil
+	return records, nil
 }
